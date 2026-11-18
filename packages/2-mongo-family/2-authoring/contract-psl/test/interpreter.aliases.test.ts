@@ -2,7 +2,6 @@ import type { Contract } from '@internal/contract/types';
 import { enumType, member } from '@internal/contract-authoring';
 import {
   type AuthoringContributions,
-  temporalAuthoringPresets,
   temporalTypeAliases,
 } from '@internal/framework-components/authoring';
 import {
@@ -10,10 +9,11 @@ import {
   singleGeneratorBinding,
 } from '@internal/framework-components/components';
 import { UNBOUND_NAMESPACE_ID } from '@internal/framework-components/ir';
-import { mongoCodecLookup, mongoDataTypeLookup } from '@internal/mongo-contract/test';
+import { mongoCodecLookup } from '@internal/mongo-contract/test';
 import { jsonValue, mapBlock } from '@internal/psl-parser';
 import { describe, expect, it } from 'vitest';
 import { interpretMongoContract } from './interpreter-test-helpers';
+import { mongoDataTypeSupport } from './mongo-type-lookups';
 
 const generatorFunctions = assembleGeneratorFunctions([
   {
@@ -35,7 +35,6 @@ const mongoDate = { codecId: 'mongo/date@1' } as const;
 
 const authoringContributions: AuthoringContributions = {
   type: { temporal: temporalTypeAliases(mongoDate, 'a JavaScript Date') },
-  field: { temporal: temporalAuthoringPresets(mongoDate) },
   entityTypes: {
     enum: {
       kind: 'entity',
@@ -62,7 +61,7 @@ const authoringContributions: AuthoringContributions = {
 
 function interpret(schema: string) {
   return interpretMongoContract(schema, {
-    scalarTypeCodecIds: new Map([
+    scalarTypes: new Map([
       ['ObjectId', 'mongo/objectId@1'],
       ['String', 'mongo/string@1'],
       ['Date', 'mongo/date@1'],
@@ -70,7 +69,7 @@ function interpret(schema: string) {
     defaultFunctionRegistry: new Map(),
     generatorFunctions,
     codecLookup: mongoCodecLookup,
-    dataTypes: { entries: {}, lookup: mongoDataTypeLookup, dataTypeOfCodec: () => undefined },
+    dataTypes: mongoDataTypeSupport,
     authoringContributions,
   });
 }
@@ -168,7 +167,11 @@ model Item {
   id  ObjectId @id @map("_id")
   ref Ref
 }`);
-    expect(contract.domain.namespaces[UNBOUND_NAMESPACE_ID]?.valueObjects?.['Ref']).toEqual({
+    expect(
+      JSON.parse(
+        JSON.stringify(contract.storage.namespaces[UNBOUND_NAMESPACE_ID]?.entries['valueObject']),
+      )['Ref'],
+    ).toEqual({
       fields: {
         target: {
           type: { kind: 'scalar', codecId: 'mongo/objectId@1' },
@@ -279,23 +282,29 @@ model Post {
     ]);
   });
 
-  it('refuse an optional field typed by an alias that generates a value', () => {
-    expect(
-      diagnostics(`types {
+  it('build an optional field typed by an alias that generates a value', () => {
+    const result = interpret(`types {
   Stamp = Date @onCreate(now())
 }
 
 model Post {
   id        ObjectId @id @map("_id")
   createdAt Stamp?
-}`),
-    ).toEqual([
-      {
-        code: 'PSL_OPTIONAL_EXECUTION_DEFAULT_UNSUPPORTED',
-        message:
-          'Field "Post.createdAt" is optional, and its type alias "Stamp" generates a value, which needs a required field in MongoDB. Remove "?" or type the field without the alias.',
-      },
-    ]);
+}`);
+    if (!result.ok) throw new Error(JSON.stringify(result.failure.diagnostics));
+
+    expect({
+      field: result.value.domain.namespaces['__unbound__']?.models['Post']?.fields['createdAt'],
+      defaults: result.value.execution?.mutations.defaults,
+    }).toEqual({
+      field: { type: { kind: 'scalar', codecId: 'mongo/date@1' }, nullable: true, many: false },
+      defaults: [
+        {
+          ref: { namespace: '__unbound__', entry: 'Post', field: 'createdAt' },
+          onCreate: { kind: 'generator', id: 'timestampNow' },
+        },
+      ],
+    });
   });
 
   it('refuse a list field typed by an alias that generates a value', () => {
@@ -335,7 +344,7 @@ model Click {
 }`),
     ).toEqual([
       {
-        code: 'PSL_PRESET_ON_VARIANT_FIELD',
+        code: 'PSL_GENERATOR_ON_VARIANT_FIELD',
         message:
           'Generated value on variant "Click" field "seenAt": execution defaults apply to every document in collection "Event", so declare them on the base model.',
       },
@@ -471,18 +480,18 @@ model Post {
 });
 
 describe('Mongo PSL contributed type aliases', () => {
-  it('store what the matching presets store', () => {
+  it('store what the matching generator attributes store', () => {
     const aliased = contractOf(`model Post {
   id        ObjectId           @id @map("_id")
   createdAt temporal.CreatedAt
   updatedAt temporal.UpdatedAt @map("updated_at")
 }`);
-    const preset = contractOf(`model Post {
-  id        ObjectId             @id @map("_id")
-  createdAt temporal.createdAt()
-  updatedAt temporal.updatedAt() @map("updated_at")
+    const attributes = contractOf(`model Post {
+  id        ObjectId @id @map("_id")
+  createdAt Date     @onCreate(now())
+  updatedAt Date     @onCreate(now()) @onUpdate(now()) @map("updated_at")
 }`);
-    expect(aliased).toEqual(preset);
+    expect(aliased).toEqual(attributes);
   });
 
   it('resolve once for every field typed by them', () => {
@@ -532,18 +541,25 @@ describe('Mongo PSL contributed type aliases', () => {
     ]);
   });
 
-  it('refuse an optional field', () => {
-    expect(
-      diagnostics(`model Post {
+  it('build an optional field', () => {
+    const result = interpret(`model Post {
   id        ObjectId            @id @map("_id")
   updatedAt temporal.UpdatedAt?
-}`),
-    ).toEqual([
-      {
-        code: 'PSL_OPTIONAL_EXECUTION_DEFAULT_UNSUPPORTED',
-        message:
-          'Field "Post.updatedAt" is optional, and its type alias "temporal.UpdatedAt" generates a value, which needs a required field in MongoDB. Remove "?" or type the field without the alias.',
-      },
-    ]);
+}`);
+    if (!result.ok) throw new Error(JSON.stringify(result.failure.diagnostics));
+
+    expect({
+      field: result.value.domain.namespaces['__unbound__']?.models['Post']?.fields['updatedAt'],
+      defaults: result.value.execution?.mutations.defaults,
+    }).toEqual({
+      field: { type: { kind: 'scalar', codecId: 'mongo/date@1' }, nullable: true, many: false },
+      defaults: [
+        {
+          ref: { namespace: '__unbound__', entry: 'Post', field: 'updatedAt' },
+          onCreate: { kind: 'generator', id: 'timestampNow' },
+          onUpdate: { kind: 'generator', id: 'timestampNow' },
+        },
+      ],
+    });
   });
 });

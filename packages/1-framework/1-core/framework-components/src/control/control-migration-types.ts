@@ -15,15 +15,17 @@ import { ifDefined } from '@internal/utils/defined';
 import type { Result } from '@internal/utils/result';
 import { type StructuredError, structuredError } from '@internal/utils/structured-error';
 import type { TargetBoundComponentDescriptor } from '../shared/framework-components';
-import type { ImportSpecifierResolver } from '../shared/import-specifier-resolver';
 import type {
   ControlAdapterInstance,
   ControlDriverInstance,
   ControlFamilyInstance,
 } from './control-instances';
 import type { OperationContext } from './control-operation-results';
+import type { DatabasePolicies } from './database-policies';
 import type {
   AppliedMigrationStatement,
+  EnumValueCoordinateJson,
+  KeepDataEdit,
   MigrationPlanNamespaces,
   MigrationPlanSubjects,
   MigrationSubject,
@@ -275,18 +277,9 @@ export interface MigrationPlanWithAuthoringSurface extends MigrationPlan {
    * `migration.ts`. Output may start with a shebang; when it does, the caller
    * should make the resulting file executable.
    *
-   * `resolveImportSpecifier` rewrites every package name the rendered file
-   * imports for the import root the consuming application installed (ADR
-   * 242), exactly as the same resolver does for `contract.d.ts` — a
-   * scaffolded migration is a file the application keeps, so every name in
-   * it has to be one the application can resolve. The caller supplies it
-   * rather than the plan capturing it, because the project a plan is
-   * rendered into is known at the render call and not at planning time: `db
-   * init` and `db update` build plans they never render. Pass
-   * {@link import('../shared/import-specifier-resolver').keepInternalSpecifiers}
-   * to emit workspace names unchanged.
+   * `migrationModule` is the module the rendered file imports its base class, its CLI entrypoint and every operation helper from: the config's `migrations.module`. The caller supplies it rather than the plan capturing it, because `db init` and `db update` build plans they never render.
    */
-  renderTypeScript(resolveImportSpecifier: ImportSpecifierResolver): string;
+  renderTypeScript(migrationModule: string): string;
 }
 
 // ============================================================================
@@ -310,6 +303,11 @@ export interface MigrationPlannerConflict {
    * on this field, not on the conflict's kind, which each family names.
    */
   readonly refusedStatement?: ResolvedMigrationStatement;
+  /**
+   * Set when the change can be written by hand instead: the statements to leave out of a plan, whose
+   * `migration.ts` the user then adds the operations the conflict's `why` names to.
+   */
+  readonly leaveOut?: readonly ResolvedMigrationStatement[];
 }
 
 /**
@@ -394,14 +392,14 @@ export interface MigrationRunnerFailure extends StructuredError {
 /** The facts of a failed migration run. Each fact appears once. */
 export interface MigrationRunnerFailureMeta {
   /**
-   * Identifier of the space whose plan caused the rollback when
-   * {@link MigrationRunner.execute} processes multiple spaces.
+   * The space whose plan failed when {@link MigrationRunner.execute} processes multiple spaces.
    */
   readonly failingSpace?: string;
   /**
    * Whether the database is as it was before the failed apply: `true` when the runner rolled the
    * apply back or failed before it changed anything, `false` when what it changed stays. Absent when
-   * the runner does not say.
+   * the runner does not say. Creating the runner's own control tables (the marker and the ledger)
+   * does not count as a change: it is `true` when only those were created.
    */
   readonly databaseUnchanged?: boolean;
   /** The check that did not hold, when a precheck or postcheck failed. */
@@ -413,6 +411,13 @@ export interface MigrationRunnerFailureMeta {
    * step fail: first the field of the failed step, then the others of the same migration.
    */
   readonly rowsWithoutValue?: readonly RowsWithoutValue[];
+  /**
+   * The data that still holds stored enum values whose removal its storage cannot take, when that
+   * made a check fail: first the data of the failed check, then the others of the same migration.
+   */
+  readonly rowsHoldingValue?: readonly RowsHoldingValue[];
+  /** The existing rows that a check the failed operation adds refuses, when that made the operation fail. */
+  readonly rowsFailingCheck?: RowsFailingCheck;
   /** The objects in the database that kept the failed operation from running, such as a view on a table to drop. */
   readonly blockingObjects?: readonly BlockingObject[];
   /** The differences the schema check after apply found, when that check failed. */
@@ -483,6 +488,30 @@ export function withDatabaseUnchanged<TCode extends MigrationRunnerFailure['code
   });
   if (failure.stack !== undefined) attributed.stack = failure.stack;
   return attributed;
+}
+
+/** The data that still holds the stored value of an enum value a plan removes from storage that cannot do without it. */
+export interface RowsHoldingValue {
+  /** The enum value, in the JSON form statements report, which leaves out the unbound namespace. */
+  readonly enumValue: EnumValueCoordinateJson;
+  /** The stored value, as the database stores it. */
+  readonly value: string | number;
+  /** How many rows hold it. */
+  readonly rows: number;
+  /** The position of the operation in the operations of the failing space's plan. */
+  readonly operationIndex: number;
+  /** The edit to the migration's `migration.ts` that keeps the data, when the target can say it. */
+  readonly keepDataEdit?: KeepDataEdit;
+}
+
+/** The existing rows that a check the failed operation adds refuses. The failure's message names where the check is and how to find the rows. */
+export interface RowsFailingCheck {
+  /** The check, as the database names it. */
+  readonly check: string;
+  /** The check the plan drops before it adds this one, when the plan replaces a check. While it holds, the rows cannot be changed to fit the new check. */
+  readonly replacedCheck?: string;
+  /** The position of the operation in the operations of the failing space's plan. */
+  readonly operationIndex: number;
 }
 
 /** A field that is to become required while existing rows have no value for it. */
@@ -733,6 +762,8 @@ export interface MigrationRunnerPerSpaceOptions<
   readonly driver: ControlDriverInstance<TFamilyId, TTargetId>;
   readonly destinationContract: unknown;
   readonly policy: MigrationOperationPolicy;
+  /** When set, the marker update at the end of the run records these as the database's policies. */
+  readonly databasePolicies?: DatabasePolicies;
   readonly executionChecks?: MigrationRunnerExecutionChecks;
   readonly frameworkComponents: ReadonlyArray<TargetBoundComponentDescriptor<TFamilyId, TTargetId>>;
   /**
@@ -773,13 +804,20 @@ export interface MigrationRunner<
    * at the load boundary. Runners do not re-verify plans and assume the
    * `(metadata, ops)` pairs on disk have not been tampered with since emit.
    *
-   * Atomicity semantics differ by family: SQL targets open one outer
-   * transaction across every space; Mongo iterates per-space without an
-   * outer transaction and relies on per-space verify-gated marker atomicity.
+   * A failure states what it left in {@link MigrationRunnerFailureMeta.failingSpace} and
+   * {@link MigrationRunnerFailureMeta.databaseUnchanged}. On a target whose DDL is transactional the
+   * runner rolls the whole apply back and reports `databaseUnchanged: true`; otherwise it reports
+   * whether the database changed, and the operations that already ran stay applied.
    */
   execute(options: {
     readonly driver: ControlDriverInstance<TFamilyId, TTargetId>;
     readonly perSpaceOptions: ReadonlyArray<MigrationRunnerPerSpaceOptions<TFamilyId, TTargetId>>;
+    /**
+     * The database's policies as the caller saw them when it checked the run. Once it holds its
+     * lock, and before it applies the first space, the runner compares them with the application
+     * space's marker and fails the run as a concurrent change when they differ.
+     */
+    readonly expectedDatabasePolicies?: DatabasePolicies;
   }): Promise<MigrationRunnerResult>;
 }
 

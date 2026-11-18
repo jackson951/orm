@@ -34,6 +34,7 @@ import {
   record,
   referencedFieldRef,
   str,
+  writtenScalar,
 } from '@internal/psl-parser';
 import type { FieldAttributeAst, ModelAttributeAst, PslSources } from '@internal/psl-parser/syntax';
 
@@ -177,8 +178,15 @@ export const idFieldSpec = fieldAttribute('id', {
   documentation:
     'Marks the field stored as `_id`, the document’s id. The field must be stored as `_id`: name it `_id` or add `@map("_id")`. A model may leave `@id` out; its documents still get an ObjectId `_id`.',
 });
+const indexMapArg = {
+  type: optional(str()),
+  documentation:
+    'The name MongoDB stores the index under. Without it, the index is named after its keys and directions, such as `email_1`.',
+};
+
 export const uniqueFieldSpec = fieldAttribute('unique', {
   documentation: 'Requires values in this field to be unique across the collection.',
+  named: { map: indexMapArg },
 });
 
 export const relationFieldSpec = fieldAttribute('relation', {
@@ -226,8 +234,9 @@ export function baseModelSpec() {
       },
       {
         key: 'value',
-        type: str(),
-        documentation: 'The discriminator value identifying this variant.',
+        type: writtenScalar(str()),
+        documentation:
+          "The discriminator value identifying this variant, a value of the discriminator field's type.",
       },
     ],
   });
@@ -324,6 +333,7 @@ function buildIndexModelSpec(name: 'index' | 'unique') {
       },
     ],
     named: {
+      map: indexMapArg,
       type: {
         type: optional(
           oneOf(num(1), num(-1), str('text'), str('2dsphere'), str('2d'), str('hashed')),
@@ -376,6 +386,7 @@ function buildTextIndexModelSpec() {
       },
     ],
     named: {
+      map: indexMapArg,
       filter: {
         type: optional(json()),
         documentation: 'A JSON partial-filter expression limiting which documents are indexed.',

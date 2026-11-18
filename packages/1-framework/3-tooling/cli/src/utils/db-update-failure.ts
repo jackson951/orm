@@ -2,10 +2,12 @@ import type { MigrationRunnerFailure } from '@internal/framework-components/cont
 import type { RunnerFailureFacts } from '../control-api/types';
 import type { CliStructuredError } from './cli-errors';
 import { chooseAction, editFileAction } from './next-actions';
-import { type CliInvocation, cliCommand } from './printed-command';
+import { type CliInvocation, cliCommand, dbUpdateRerun } from './printed-command';
 import {
   blockingObjectsAdvice,
   dbUpdateFailedTypeChangeAdvice,
+  dbUpdateRowsFailingCheckAdvice,
+  dbUpdateRowsHoldingValueAdvice,
   dbUpdateRowsWithoutValueAdvice,
 } from './runner-failure-advice';
 import { runnerFailureError } from './runner-failure-error';
@@ -25,28 +27,33 @@ export function dbUpdateRunnerFailureError(
   },
 ): CliStructuredError {
   const { databaseStorageHash, invocation } = context;
-  const update = cliCommand(invocation, 'db update');
+  const update = dbUpdateRerun(invocation);
   const { blockingObjects } = failure.meta;
   const advice =
     blockingObjects !== undefined
-      ? blockingObjectsAdvice(
-          blockingObjects,
-          cliCommand(invocation, 'db update', invocation.rerunArgs ?? []),
-        )
+      ? blockingObjectsAdvice(blockingObjects, update)
       : facts.failedTypeChange !== undefined
         ? dbUpdateFailedTypeChangeAdvice(facts.failedTypeChange, databaseStorageHash, invocation)
         : facts.rowsWithoutValue !== undefined
           ? dbUpdateRowsWithoutValueAdvice(facts.rowsWithoutValue, databaseStorageHash, invocation)
-          : schemaCheckIssues(failure) !== undefined
-            ? [
-                editFileAction(
-                  `Change the contract source to resolve the issues listed, re-run \`${cliCommand(invocation, 'contract emit')}\`, then re-run \`${update}\``,
-                ),
-              ]
-            : [
-                chooseAction(
-                  `Inspect the reported conflict, reconcile schema drift if needed, then re-run \`${update}\``,
-                ),
-              ];
+          : facts.rowsHoldingValue !== undefined
+            ? dbUpdateRowsHoldingValueAdvice(
+                facts.rowsHoldingValue,
+                databaseStorageHash,
+                invocation,
+              )
+            : facts.rowsFailingCheck !== undefined
+              ? dbUpdateRowsFailingCheckAdvice(
+                  facts.rowsFailingCheck,
+                  databaseStorageHash,
+                  invocation,
+                )
+              : schemaCheckIssues(failure) !== undefined
+                ? [
+                    editFileAction(
+                      `Change the contract source to resolve the issues listed, re-run \`${cliCommand(invocation, 'contract emit')}\`, then re-run \`${update}\``,
+                    ),
+                  ]
+                : [chooseAction(`Resolve the cause the failure names, then re-run \`${update}\``)];
   return runnerFailureError(failure, advice);
 }

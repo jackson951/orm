@@ -1,6 +1,7 @@
 import { asNamespaceId } from '@internal/contract/types';
 import { ok } from '@internal/utils/result';
 import type { PromptSurface, StatementSurface } from '@prisma/cli-engine';
+import { CliStructuredError } from '@prisma/cli-engine/protocol';
 import { describe, expect, it, vi } from 'vitest';
 import {
   askPlanQuestions,
@@ -272,11 +273,13 @@ describe('a namespace rename typed at the prompt, then planned again', () => {
     const first: PlannedQuestions = {
       dataLoss: [dropReceipt, retypeNote],
       accessChanges: [],
+      temporaryValues: [],
       namespaces,
     };
     const second: PlannedQuestions = {
       dataLoss: [retypeNote],
       accessChanges: [],
+      temporaryValues: [],
       namespaces: { removed: [], added: [] },
     };
 
@@ -321,6 +324,7 @@ describe('a namespace rename typed at the prompt, then planned again', () => {
     const first: PlannedQuestions = {
       dataLoss: [drop('Invoice', 0), drop('Receipt', 1)],
       accessChanges: [],
+      temporaryValues: [],
       namespaces: { removed: ['billing'], added: ['finance'] },
     };
     const asked: string[] = [];
@@ -353,8 +357,8 @@ describe('a namespace rename typed at the prompt, then planned again', () => {
       replan: async (planned) =>
         ok(
           planned.length === 1
-            ? { dataLoss: [drop('Invoice', 0)], accessChanges: [] }
-            : { dataLoss: [], accessChanges: [] },
+            ? { dataLoss: [drop('Invoice', 0)], accessChanges: [], temporaryValues: [] }
+            : { dataLoss: [], accessChanges: [], temporaryValues: [] },
         ),
     });
 
@@ -363,5 +367,42 @@ describe('a namespace rename typed at the prompt, then planned again', () => {
       'billing.Invoice:finance.Bill',
     ]);
     expect(asked).toEqual(['billing.Invoice', 'billing.Invoice']);
+  });
+});
+
+describe('a refusal to answer a question that names ways to keep the data', () => {
+  it('leads its next actions with those ways, and names them once', async () => {
+    const way = 'To keep it, plan the change with `prisma migration plan`.';
+    const kept: PlanQuestion = {
+      ...question('Status.DONE'),
+      question: `Remove value "done" would lose enum value "Status.DONE". ${way}`,
+      keepDataWays: [way],
+    };
+    const prompt = {
+      statements: vi.fn(async () => {
+        throw new CliStructuredError('CLI.CONSENT_REQUIRED', '"Status.DONE" needs a statement.', {
+          why: kept.question,
+          nextActions: [
+            { kind: 'user-choice', label: 'Run the command again with --delete Status.DONE' },
+          ],
+          meta: { unanswered: [{ subject: 'Status.DONE', verbs: ['delete'] }] },
+        });
+      }),
+    } as unknown as PromptSurface;
+    const statements: StatementSurface = {
+      take: vi.fn(() => []) as StatementSurface['take'],
+      values: () => [],
+    };
+
+    await expect(promptPlanQuestions(prompt, statements)([kept])).rejects.toMatchObject({
+      code: 'CLI.CONSENT_REQUIRED',
+      message: '"Status.DONE" needs a statement.',
+      why: 'Remove value "done" would lose enum value "Status.DONE".',
+      nextActions: [
+        { kind: 'user-choice', label: way },
+        { kind: 'user-choice', label: 'Run the command again with --delete Status.DONE' },
+      ],
+      meta: { unanswered: [{ subject: 'Status.DONE', verbs: ['delete'] }] },
+    });
   });
 });
